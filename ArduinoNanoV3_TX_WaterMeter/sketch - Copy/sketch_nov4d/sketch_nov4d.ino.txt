@@ -1,0 +1,112 @@
+/* ================= Meter Node (Nano V3) =================
+   Water Meter TX
+   - Counts flow pulses on D2 (reed/hall)
+   - Sends cumulative milliliters via nRF24
+   ------------------------------------------------------- */
+
+// -------- USER CALIBRATION --------
+static const float    ML_PER_PULSE      = 2.00f;   // adjust after jug test
+static const uint32_t MIN_PULSE_US      = 800;     // debounce (raise if double counts)
+static const uint16_t STEP_mL           = 10;      // send every +10 mL
+static const uint32_t HEARTBEAT_MS      = 2000;    // send heartbeat if unchanged
+// ----------------------------------
+
+// Pins
+static const uint8_t FLOW_PIN = 2;   // D2 INT0
+static const uint8_t RF_CE    = 9;
+static const uint8_t RF_CSN   = 10;
+
+#include <SPI.h>
+#include <RF24.h>
+RF24 radio(RF_CE, RF_CSN);
+
+// RF must match Mega HUB
+const uint8_t  RF_CHANNEL = 76;
+const rf24_datarate_e RF_RATE = RF24_250KBPS;
+
+// Pipe address (must match HUB’s water pipe)
+const byte PIPE_WATER_TO_MEGA[6] = "H2M01";
+
+// Packet
+struct __attribute__((packed)) FlowPkt {
+  uint32_t ms;
+  uint32_t total_mL;   // cumulative mL
+  uint32_t seq;        // sequence counter
+  uint8_t  node_id;    // e.g., 3 = Meter node
+};
+
+volatile uint32_t g_pulses = 0;
+volatile uint32_t g_lastPulseUs = 0;
+
+void onPulse() {
+  uint32_t nowUs = micros();
+  if (nowUs - g_lastPulseUs >= MIN_PULSE_US) {
+    g_pulses++;
+    g_lastPulseUs = nowUs;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(FLOW_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN), onPulse, FALLING);
+
+  if (!radio.begin()) {
+    Serial.println(F("RF24 init failed"));
+  }
+  radio.setChannel(RF_CHANNEL);
+  radio.setDataRate(RF_RATE);
+  radio.setPALevel(RF24_PA_LOW);   // conservative; raise if needed
+  radio.setAutoAck(true);
+  radio.setRetries(3, 5);
+  radio.disableDynamicPayloads();
+
+  radio.openWritingPipe(PIPE_WATER_TO_MEGA);
+  radio.stopListening();
+
+  Serial.println(F("Meter Node ready."));
+}
+
+void loop() {
+  static uint32_t lastSentBucket = UINT32_MAX;
+  static uint32_t lastHeartbeatMs = 0;
+  static uint32_t seq = 0;
+
+  // snapshot pulse count
+  noInterrupts();
+  uint32_t pulses = g_pulses;
+  interrupts();
+
+  // compute current total mL (rounded)
+  float total_mL_f = pulses * ML_PER_PULSE;
+  uint32_t total_mL_i = (uint32_t)(total_mL_f + 0.5f);
+
+  // compute bucket for STEP_mL
+  uint32_t bucket = total_mL_i / STEP_mL;
+
+  bool shouldSend = false;
+  if (bucket != lastSentBucket) {
+    lastSentBucket = bucket;
+    shouldSend = true;       // new STEP_mL reached
+  }
+
+  uint32_t now = millis();
+  if (!shouldSend && (now - lastHeartbeatMs >= HEARTBEAT_MS)) {
+    shouldSend = true;       // heartbeat even if unchanged
+  }
+
+  if (shouldSend) {
+    FlowPkt pkt;
+    pkt.ms = now;
+    pkt.total_mL = total_mL_i;
+    pkt.seq = ++seq;
+    pkt.node_id = 3; // arbitrary ID for the meter node
+
+    bool ok = radio.write(&pkt, sizeof(pkt));
+    lastHeartbeatMs = now;
+
+    Serial.print(F("TX total=")); Serial.print(total_mL_i);
+    Serial.print(F(" mL, seq=")); Serial.print(seq);
+    Serial.print(F(" -> ")); Serial.println(ok ? F("OK") : F("FAIL"));
+  }
+}
